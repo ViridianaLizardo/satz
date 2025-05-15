@@ -1,0 +1,399 @@
+---
+title: "South American Transition Zone asteraceae"
+output: html_notebook
+editor_options: 
+  chunk_output_type: inline
+---
+
+This is the code to obtain and process the data for the assessment of niche shifts and Cenocron assignation of MTZ's plants.
+
+# Set up
+
+## Libraries
+
+```{r}
+library(tidyverse)
+library(ape)
+library(ggtree)
+library(deeptime)
+
+library(rgbif)
+library(CoordinateCleaner)
+
+library(sf)
+library(tmap)
+library(kewr)
+sf_use_s2(F)
+
+data("World")
+source('C:/Users/USER/Desktop/R projects/theme_virix.r')
+```
+
+## Phylogeny
+
+Phylogeny obtained from ["Plant and Fungal Trees of Life Project (PAFTOL) at the Royal Botanic Gardens"](http://treeoflife.kew.org "PAFTOL 2025").
+
+First we remove all the tips that are not species.
+
+```{r}
+tree_all <- read.tree(file = "data/trees/treeoflife.3.0.tree" )
+  
+# Seleccionar las asteráceas
+
+all_sp <- tree_all$tip.label
+
+to_prune <- str_subset(all_sp, 'Asterales_Asteraceae_', negate = T) %>%
+  # Quitar puntas  no identificadas a especie 
+  c(., str_subset(tree_all$tip.label, '_sp.'))
+
+tree1 <- drop.tip(tree_all, to_prune)
+
+# Quitar duplicados
+# Get species name by removing the last underscore and everything after it
+species_names <- sub("_[^_]+$", "", tree1$tip.label)
+
+# Keep only the first occurrence of each species
+tips_to_drop <- tree1$tip.label[duplicated(species_names)]
+clean_tree <- drop.tip(tree1, tips_to_drop)
+
+# simplify names
+clean_tree$tip.label <- str_remove(clean_tree$tip.label,
+                                   'Asterales_Asteraceae_') %>%
+  word(1,2, sep = '_')
+
+```
+
+
+## Geographical setting
+
+The Mexican Transition Zone sensu Escalante et al.
+
+```{r}
+satz_sf <- st_read('data/SATZ.gpkg') 
+
+qtm(satz_sf)
+
+wkt_polygon<- st_as_text(satz_sf$geom)  %>% wkt_parse()
+```
+
+# Get GBIF ids to standardize taxonomi
+
+Obtain the unique ID number in GBIF of each tree tip, as well as the presence of it in the MTZ.
+
+```{r}
+source('occ_explore.R')
+library(RPushbullet)
+
+all_sp <- clean_tree$tip.label 
+
+lapply(all_sp, gbif_keys) 
+ 
+ 
+multiple_matches <- pull(read.csv('not found.csv', header = T), label) %>%
+  unique()
+
+lapply(multiple_matches, gbif_keys_synonims)
+
+pbPost(type = 'note',title = 'GBIF Keys Stopped',
+       body = paste('Avance de ',1  
+                    scales::percent(
+                    length(checked)/length(all_sp))
+                    ))
+
+
+```
+
+## Read the final database
+
+```{r}
+gbif_keys_all <- read.csv('gbif_keys.csv') %>%
+  filter(occ> 0)%>% 
+  mutate(genus = word(label, 1, sep = '_'))
+
+
+gbif_keys_all %>%
+  ggplot(aes(x = occ)) + 
+  geom_histogram(binwidth = 10 ) +
+  theme_virix() +
+  labs(x = 'Número de registros',
+       y = 'Especies',
+       title = 'Registros por especie de Asteráceas en la SATZ',
+       subtitle = 'Conteo preeliminar')+
+  coord_cartesian(expand = F)
+
+```
+
+
+## Summarize
+
+```{r}
+gbif_keys_all 
+n_genus <- gbif_keys_all %>% group_by(genus) %>% tally() %>% nrow()
+n_sp <- gbif_keys_all %>% group_by(label) %>% tally() %>% nrow()
+n_occ_sp <- gbif_keys_all %>% pull(occ) %>% mean() %>% round(., 0)
+
+data_frame(level = c('Genus', 'Species', 'Mean occ per species'),
+           number = c(n_genus, n_sp, n_occ_sp))
+           
+```
+
+# Occurrence search
+
+
+## Keys to look up
+
+```{r}
+keys <- gbif_keys_all %>% 
+  pull(usagekey) 
+
+length(keys)
+```
+
+## Occurrence download
+
+```{r}
+gbif_download <- occ_download(
+    type="and",
+    #Taxon Keys
+    pred_in("taxonKey", keys),
+    # With coordinates and no issues
+    pred("hasCoordinate", TRUE),
+    pred("hasGeospatialIssue", FALSE),
+   #pred_within('geometry', wkt_polygon),
+    #Year
+    #pred_gte("year", 1950),  
+    # Basis of record
+    #pred_in("basisOfRecord",'PRESERVED_SPECIMEN'),
+    # Only Native species
+   pred_or(pred_not(
+     pred("establishmentMeans","MANAGED")),
+      pred_not(pred_notnull("establishmentMeans"))),
+   pred_or(pred_not(pred("establishmentMeans","INTRODUCED")),
+           pred_not(pred_notnull("establishmentMeans"))),
+   pred_or(pred_not(pred("establishmentMeans","INVASIVE")),
+           pred_not(pred_notnull("establishmentMeans"))),
+   pred_or(pred_not(pred("establishmentMeans","NATURALISED")),
+           pred_not(pred_notnull("establishmentMeans"))),
+    # Only records with low uncertanty
+    pred_or(pred_lt("coordinateUncertaintyInMeters",1000),
+            pred_not(pred_notnull("coordinateUncertaintyInMeters"))),
+    format = "SIMPLE_CSV"
+    ) 
+
+occ_download_wait(gbif_download)
+
+```
+
+
+```{r}
+
+
+gbif_result <- occ_download_get(key = '0028614-250426092105405') %>%
+  occ_download_import()
+
+```
+
+# Data cleaning
+## Remove species with less 
+
+```{r echo=FALSE, results= 'asis'}
+paste('The download has', nrow(gbif_result ), 'records', 
+      n_distinct(gbif_result$species), 'species,',
+      n_distinct(gbif_result$genus), 'genus, from',
+      n_distinct(gbif_result$countryCode), 'countries.') %>% cat()
+```
+
+First, we clean using `CoordinateCleaner` to remove invalid coordinates, points at sea, at institutions, duplicates, and with equal lat-lon values.
+
+```{r}
+gbif_result_clean <- gbif_result %>% 
+  select(occurrenceID, speciesKey, order, family, species,
+         decimalLatitude, decimalLongitude, establishmentMeans) %>%
+    cc_val(lat = 'decimalLatitude', lon = 'decimalLongitude') %>%
+    cc_sea(lat = 'decimalLatitude', lon = 'decimalLongitude') %>%
+    cc_equ(lat = 'decimalLatitude', lon = 'decimalLongitude') %>%
+    cc_inst(lat = 'decimalLatitude', lon = 'decimalLongitude') %>%
+  cc_zero(lat = 'decimalLatitude', lon = 'decimalLongitude') %>%
+  cc_dupl(lat = 'decimalLatitude', lon = 'decimalLongitude')
+```
+
+## Turn into spatial object
+
+Then, the database is turned into an spatial object to count how many points per species are inside the satz.
+
+```{r}
+gbif_sf <- gbif_result_clean   %>%
+  mutate(lon = decimalLongitude,
+         lat = decimalLatitude) %>%
+  rename(usagekey = speciesKey) %>% 
+  filter(!establishmentMeans %in% c('Introduced','Uncertain', 'Vagrant', 'NativeReintroduced')) %>% 
+  left_join(.,gbif_keys_all[c(1,7)], by= 'usagekey') %>%
+  st_as_sf(coords = c('decimalLongitude',
+                      'decimalLatitude' ), 
+           crs = st_crs(satz_sf)) %>%
+    
+  st_join(satz_sf) %>% 
+  mutate(in_satz = if_else(is.na(Region), 0, 1)) %>%
+  rownames_to_column('ID') %>%
+  group_by(species) %>%
+  # Add record count
+  mutate(n = n_distinct(ID),
+            satz = sum(in_satz,na.rm = T),
+            perc_zt = satz/n,
+            # Calcular los cortes solo una vez fuera del mutate
+             endem_class = cut(perc_zt,
+                               breaks = c(0,0.05, 0.1,0.5, 0.99 ,1),
+                               include.lowest = TRUE,
+                               right = FALSE))  
+
+
+```
+
+
+
+## Count species endemic to the satz
+
+```{r}
+gbif_sf %>%
+  #filter(perc_zt > 0.005) %>%
+  group_by(label, endem_class) %>%
+  reframe(perc_zt = mean(perc_zt)) %>%
+  ggplot(aes(x = perc_zt, fill = endem_class)) + geom_histogram(binwidth = 0.01) +
+  theme_virix() +
+  labs(x = 'Porcentaje de Registros en SATZ',
+       y = 'Número de especies',
+       fill = 'Endemismo',
+       title = 'Endemismos de Asteráceas en la SATZ',
+       subtitle = '¿Eliminar <0.01 registros en SATZ?')+
+  coord_cartesian(expand = F) +
+  theme(legend.position = 'right')
+```
+```{r}
+gbif_sf %>%
+  group_by(label, endem_class) %>% summarise(perc_zt = mean(perc_zt)) %>%
+  ggplot(aes(x = perc_zt)) + geom_sf() + facet_wrap(endem_class~.) +
+  theme_virix() 
+```
+
+
+
+```{r echo=FALSE,  dpi = 150}
+data('World')
+
+credits <-paste('The database has',
+                scales::number(nrow(gbif_sf_endem),big.mark = ','),
+                'records from', 
+      scales::number(n_distinct(gbif_sf_endem$label)), 'species,',
+      n_distinct(gbif_sf_endem$family), 'families, and',
+      n_distinct(gbif_sf_endem$order), 'orders.')
+
+
+neotropics<- st_read('D:/R_spatial/data/Regionalización/Escalante/biogeoregions_escalante.gpkg')  %>%
+  filter(Region == 'Neotropical') %>% 
+  tally() 
+
+tm_shape(World, bbox = st_bbox(gbif_sf_endem)) +
+  tm_fill('gray90')+
+tm_shape(gbif_sf_endem) +
+  tm_dots(alpha = 0.05, col = 'darkred')  +
+tm_shape(neotropics) +
+  tm_borders()+
+  tm_credits(str_wrap(credits, 35), align = 'right',
+             position = c('left', 'BOTTOM')) + tm_layout(legend.outside = T)
+```
+
+
+
+## Prune tree
+```{r}
+to_prune <- read.csv('data/species_to_prune.csv') %>%
+  filter(keep ==0) %>% pull(label) %>%
+  c(tree2$tip.label[!tree2$tip.label %in% gbif_sf_endem$label]) 
+
+length(to_prune)
+
+final_tree <- drop.tip(tree2, to_prune)
+
+final_tree
+
+write.nexus(final_tree, file = 'data/neotropics.tre')
+
+```
+
+## final name database
+```{r}
+
+gbif_keys_all_clean <- gbif_keys_all %>%
+  filter(label %in% gbif_sf_endem$label)
+
+gbif_keys_all_clean %>% write.csv('data/gbif_keys_all_clean.csv')
+
+```
+
+
+
+#Save occurrence data
+```{r}
+gbif_sf_endem %>% st_drop_geometry() %>%
+  write.csv(file = 'data/occurrences.csv',row.names = F)
+```
+
+
+```{r, fig.asp= 1}
+
+library(ggrepel)
+tr_dat<- gbif_sf_endem %>%
+  st_drop_geometry() %>%
+  group_by(label, order, family, species,   perc_zt) %>% 
+  tally() %>% na.omit() 
+
+tr_dat
+
+tr_dat %>%
+  group_by(family) %>%
+  summarise(n_sp = n_distinct(label)) %>% 
+  mutate(family = if_else(n_sp<150, 'Others', family))%>%
+  group_by(family) %>%
+  summarise(n_sp = sum(n_sp)) %>%
+  arrange(desc(n_sp)) %>% 
+  mutate(csum = rev(cumsum(rev(n_sp))), 
+         pos = n_sp/2 + lead(csum, 1),
+         pos = if_else(is.na(pos), n_sp/2, pos)) -> pie_data
+
+  ggplot(pie_data,
+         aes(x = 1, y = n_sp, fill = fct_inorder(family))) +
+  geom_col(width = 1, col= 'white') +
+  scale_fill_viridis_d(option = 'inferno',direction = 1) +
+  coord_polar(theta = 'y') +
+  geom_text_repel(data = pie_data,
+                   aes(y = pos, label = family),
+                    nudge_x = 1) +
+  theme_void() +
+    theme(legend.position = 'none')
+```
+
+```{r, fig.asp= 1, fig.width= 16, dpi=600}
+
+ggtree(final_tree, ladderize = T,layout = 'circular', lwd = 0.2) %<+% tr_dat  +
+  geom_tiplab(size = 2)  + theme_tree2()
+
+
+```
+
+```{r, fig.asp= 10/1, fig.width= 16, dpi=600}
+library(deeptime)
+p1 <- ggtree(final_tree, ladderize = F,
+        lwd = 0.1) %<+% tr_dat  +
+  geom_tiplab(size = 0.5)  + theme_tree2()
+
+p2 <- p1+
+  geom_nodelab(hjust = 0, color = 'black', size = 2) 
+
+p3 <- revts(p2) + xlim(c(-400, 50)) + 
+  theme(panel.grid.major.x = element_line(),
+        panel.grid.minor.x = element_line(linetype = 2)) 
+
+
+ggsave(filename = 'tree.jpg',plot = p3,device = 'jpeg',width = 10,height = 100,units = 'in',dpi = 300, limitsize = F)
+
+```
