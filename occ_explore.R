@@ -140,7 +140,7 @@ occ_explore_02 <- function(x){
 
 gbif_keys_synonims <- function(x){try(occ_explore_02(x))}
 
-lapply(multiple_matches, gbif_keys_synonims)
+#lapply(multiple_matches, gbif_keys_synonims)
 
 ## no DOUBTFUL
 occ_explore_03 <- function(x){
